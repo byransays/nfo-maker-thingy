@@ -14,15 +14,17 @@ USER_AGENT = "nfothingy/1.0 ( user@example.com )"
 
 # TMDB v3 API key. Required for the `movie` and `episode` subcommands.
 # Get one for free at https://www.themoviedb.org/settings/api
-TMDB_API_KEY = ""
+TMDB_API_KEY = "058faffac6f7ae1061eafa4ef0b3e4b6"
 
-RATE_LIMIT_SECONDS = 1.0
+
+RATE_LIMIT_SECONDS = 1.3
 SCORE_TRUST_THRESHOLD = 90
 SCORE_MIN_THRESHOLD = 60
 TAG_MIN_COUNT = 1
 MAX_GENRES = 3
 MAX_ACTORS = 15
-DEFAULT_RESULTS = 5
+
+DEFAULT_RESULTS = 100
 
 _last_request_time: float = 0.0
 
@@ -33,9 +35,20 @@ _TITLE_NOISE = re.compile(
     re.IGNORECASE,
 )
 
+_SQUARE_BRACKETS = re.compile(r'\s*\[[^]]*]')
+_BARE_YEAR = re.compile(r'\s*\(\s*(?:19|20)\d{2}\s*\)')
+_APOSTROPHES = str.maketrans({c: "'" for c in "`´‘’ʼ′"})
+
+
+def _fold_apostrophes(text: str) -> str:
+    return text.translate(_APOSTROPHES)
+
 
 def _clean_title(title: str) -> str:
-    return _TITLE_NOISE.sub("", title).strip()
+    title = _TITLE_NOISE.sub("", title)
+    title = _SQUARE_BRACKETS.sub("", title)
+    title = _BARE_YEAR.sub("", title)
+    return title.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +123,10 @@ def _add_uniqueid(root: ET.Element, id_type: str, value, default: bool = False) 
 
 
 def parse_musicvideo_filename(path: str | Path) -> dict:
-    stem = Path(path).stem
-    # Match a dash with at least one space on either side, e.g. " - ", " -", "- "
-    parts = re.split(r'\s+-\s*|\s*-\s+', stem, maxsplit=1)
+    stem = _fold_apostrophes(Path(path).stem)
+    # Match a dash with at least one space on either side, e.g. " - ", " -", "- ".
+    # Accept en/em dashes too: YouTube titles sometimes use them instead.
+    parts = re.split(r'\s+[-–—]\s*|\s*[-–—]\s+', stem, maxsplit=1)
     if len(parts) == 2:
         return {"artist": parts[0].strip(), "title": _clean_title(parts[1]), "raw_stem": stem}
     return {"artist": "", "title": _clean_title(stem), "raw_stem": stem}
@@ -148,6 +162,37 @@ def _pick_best_recording(recordings: list, artist: str, title: str) -> dict | No
     return best
 
 
+def _first_album(recordings: list, artist: str, title: str) -> tuple | None:
+    norm_artist = _normalize(artist)
+    norm_title = _normalize(title)
+    best = None
+
+    for rec in recordings:
+        rec_credits = rec.get("artist-credit") or []
+        if artist:
+            if not rec_credits:
+                continue
+            if _normalize(rec_credits[0].get("name", "")) != norm_artist:
+                continue
+        if _normalize(rec.get("title", "")) != norm_title:
+            continue
+
+        for release in rec.get("releases") or []:
+            group = release.get("release-group") or {}
+            # Studio albums only: skip bootlegs, live albums and compilations.
+            if release.get("status") != "Official":
+                continue
+            if group.get("primary-type") != "Album":
+                continue
+            if group.get("secondary-types"):
+                continue
+            date = release.get("date")
+            if date and (best is None or date < best[0]):
+                best = (date, rec, release)
+
+    return (best[1], best[2]) if best else None
+
+
 def search_recording(artist: str, title: str) -> dict | None:
     _wait_for_rate_limit()
 
@@ -179,9 +224,15 @@ def search_recording(artist: str, title: str) -> dict | None:
 
     data = response.json()
     recordings = data.get("recordings", [])
-    best = _pick_best_recording(recordings, artist, title)
-    if best is None:
-        return None
+
+    album_match = _first_album(recordings, artist, title)
+    if album_match is not None:
+        best, album_release = album_match
+    else:
+        best = _pick_best_recording(recordings, artist, title)
+        album_release = None
+        if best is None:
+            return None
 
     # Extract artist credits
     artist_credits = best.get("artist-credit", [])
@@ -197,12 +248,13 @@ def search_recording(artist: str, title: str) -> dict | None:
     )
     genres = [t["name"] for t in tags_sorted[:MAX_GENRES]]
 
-    # Extract release info
-    releases = best.get("releases", [])
-    album = releases[0]["title"] if releases else None
+    album = album_release["title"] if album_release else None
 
-    # Dates
-    release_date = best.get("first-release-date", "") or ""
+    release_date = (
+        album_release.get("date")
+        if album_release
+        else (best.get("first-release-date") or "")
+    )
     year = release_date[:4] if release_date else None
     premiered = release_date if len(release_date) >= 8 else None
 
@@ -537,8 +589,15 @@ def build_episode_nfo(e: dict) -> ET.ElementTree:
 
 def _process_musicvideo(file_path: str, overwrite: bool) -> None:
     parsed = parse_musicvideo_filename(file_path)
-    if not parsed["artist"] and not parsed["title"]:
+    if not parsed["title"]:
         print("  skipped: could not parse filename", file=sys.stderr)
+        return
+
+    if not parsed["artist"]:
+        print(
+            f'  skipped: no artist in filename "{parsed["raw_stem"]}"',
+            file=sys.stderr,
+        )
         return
 
     metadata = search_recording(parsed["artist"], parsed["title"])
@@ -627,6 +686,11 @@ def main() -> None:
     handler = _HANDLERS[args.type]
 
     for file_path in args.files:
+        nfo_path = Path(file_path).with_suffix(".nfo")
+        if nfo_path.exists() and not args.overwrite:
+            print(f"  skipped (NFO exists): {nfo_path}", file=sys.stderr)
+            continue
+
         print(f"Processing: {file_path}", file=sys.stderr)
         try:
             handler(file_path, args.overwrite)
