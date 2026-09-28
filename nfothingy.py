@@ -14,7 +14,7 @@ USER_AGENT = "nfothingy/1.0 ( user@example.com )"
 
 # TMDB v3 API key. Required for the `movie` and `episode` subcommands.
 # Get one for free at https://www.themoviedb.org/settings/api
-TMDB_API_KEY = "FILL ME IN"
+TMDB_API_KEY = "058faffac6f7ae1061eafa4ef0b3e4b6"
 
 
 RATE_LIMIT_SECONDS = 1.3
@@ -37,6 +37,7 @@ _TITLE_NOISE = re.compile(
 
 _SQUARE_BRACKETS = re.compile(r'\s*\[[^]]*]')
 _BARE_YEAR = re.compile(r'\s*\(\s*(?:19|20)\d{2}\s*\)')
+_TRAILING_BARE_YEAR = re.compile(r'\s*[-–—]\s*(?:19|20)\d{2}\s*$')
 _APOSTROPHES = str.maketrans({c: "'" for c in "`´‘’ʼ′"})
 
 
@@ -124,6 +125,7 @@ def _add_uniqueid(root: ET.Element, id_type: str, value, default: bool = False) 
 
 def parse_musicvideo_filename(path: str | Path) -> dict:
     stem = _fold_apostrophes(Path(path).stem)
+    stem = _TRAILING_BARE_YEAR.sub("", stem)
     # Match a dash with at least one space on either side, e.g. " - ", " -", "- ".
     # Accept en/em dashes too: YouTube titles sometimes use them instead.
     parts = re.split(r'\s+[-–—]\s*|\s*[-–—]\s+', stem, maxsplit=1)
