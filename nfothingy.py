@@ -589,71 +589,74 @@ def build_episode_nfo(e: dict) -> ET.ElementTree:
 # ---------------------------------------------------------------------------
 
 
-def _process_musicvideo(file_path: str, overwrite: bool) -> None:
+def _process_musicvideo(file_path: str, overwrite: bool) -> str | None:
+    """Return a label if no NFO could be made for the file, else None."""
     parsed = parse_musicvideo_filename(file_path)
     if not parsed["title"]:
         print("  skipped: could not parse filename", file=sys.stderr)
-        return
+        return Path(file_path).name
 
     if not parsed["artist"]:
         print(
             f'  skipped: no artist in filename "{parsed["raw_stem"]}"',
             file=sys.stderr,
         )
-        return
+        return Path(file_path).name
 
     metadata = search_recording(parsed["artist"], parsed["title"])
     if metadata is None:
+        label = f'{parsed["artist"]} - {parsed["title"]}'
         print(
-            f"  skipped: no confident MusicBrainz match for "
-            f'"{parsed["artist"]} - {parsed["title"]}"',
+            f'  skipped: no confident MusicBrainz match for "{label}"',
             file=sys.stderr,
         )
-        return
+        return label
 
     nfo_path = write_nfo(file_path, build_musicvideo_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
+    return None
 
 
-def _process_movie(file_path: str, overwrite: bool) -> None:
+def _process_movie(file_path: str, overwrite: bool) -> str | None:
+    """Return a label if no NFO could be made for the file, else None."""
     parsed = parse_movie_filename(file_path)
     if not parsed["title"]:
         print("  skipped: could not parse filename", file=sys.stderr)
-        return
+        return Path(file_path).name
 
     metadata = fetch_movie(parsed["title"], parsed["year"])
     if metadata is None:
         label = parsed["title"] + (f" ({parsed['year']})" if parsed["year"] else "")
         print(f'  skipped: no confident TMDB match for "{label}"', file=sys.stderr)
-        return
+        return label
 
     nfo_path = write_nfo(file_path, build_movie_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
+    return None
 
 
-def _process_episode(file_path: str, overwrite: bool) -> None:
+def _process_episode(file_path: str, overwrite: bool) -> str | None:
+    """Return a label if no NFO could be made for the file, else None."""
     parsed = parse_episode_filename(file_path)
     if not parsed["show"] or parsed["season"] is None:
         print(
             "  skipped: could not parse show/season/episode from filename",
             file=sys.stderr,
         )
-        return
+        return Path(file_path).name
 
     metadata = fetch_episode(parsed["show"], parsed["season"], parsed["episode"])
     if metadata is None:
-        print(
-            f'  skipped: no confident TMDB match for "{parsed["show"]} '
-            f'S{parsed["season"]:02d}E{parsed["episode"]:02d}"',
-            file=sys.stderr,
-        )
-        return
+        label = f'{parsed["show"]} S{parsed["season"]:02d}E{parsed["episode"]:02d}'
+        print(f'  skipped: no confident TMDB match for "{label}"', file=sys.stderr)
+        return label
 
     nfo_path = write_nfo(file_path, build_episode_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
+    return None
 
 
 _HANDLERS = {
@@ -687,6 +690,9 @@ def main() -> None:
     args = parser.parse_args()
     handler = _HANDLERS[args.type]
 
+    attempted = 0
+    unmatched: list[str] = []
+
     for file_path in args.files:
         nfo_path = Path(file_path).with_suffix(".nfo")
         if nfo_path.exists() and not args.overwrite:
@@ -694,10 +700,23 @@ def main() -> None:
             continue
 
         print(f"Processing: {file_path}", file=sys.stderr)
+        attempted += 1
         try:
-            handler(file_path, args.overwrite)
+            failed_label = handler(file_path, args.overwrite)
         except Exception as exc:
             print(f"  ERROR: {exc}", file=sys.stderr)
+            failed_label = Path(file_path).name
+        if failed_label:
+            unmatched.append(failed_label)
+
+    if unmatched:
+        print(file=sys.stderr)
+        if len(unmatched) == attempted:
+            print("No matches were found - check your file naming convention.", file=sys.stderr)
+        else:
+            print(f"No NFO created for {len(unmatched)} file(s):", file=sys.stderr)
+            for label in unmatched:
+                print(f"  {label}", file=sys.stderr)
 
 
 if __name__ == "__main__":
