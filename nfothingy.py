@@ -37,7 +37,6 @@ _TITLE_NOISE = re.compile(
 
 _SQUARE_BRACKETS = re.compile(r'\s*\[[^]]*]')
 _BARE_YEAR = re.compile(r'\s*\(\s*(?:19|20)\d{2}\s*\)')
-_TRAILING_BARE_YEAR = re.compile(r'\s*[-–—]\s*(?:19|20)\d{2}\s*$')
 _APOSTROPHES = str.maketrans({c: "'" for c in "`´‘’ʼ′"})
 
 
@@ -125,7 +124,6 @@ def _add_uniqueid(root: ET.Element, id_type: str, value, default: bool = False) 
 
 def parse_musicvideo_filename(path: str | Path) -> dict:
     stem = _fold_apostrophes(Path(path).stem)
-    stem = _TRAILING_BARE_YEAR.sub("", stem)
     # Match a dash with at least one space on either side, e.g. " - ", " -", "- ".
     # Accept en/em dashes too: YouTube titles sometimes use them instead.
     parts = re.split(r'\s+[-–—]\s*|\s*[-–—]\s+', stem, maxsplit=1)
@@ -398,22 +396,32 @@ def _pick_best_movie(results: list, title: str, year: str | None) -> dict | None
     return None
 
 
-def fetch_movie(title: str, year: str | None) -> dict | None:
-    params = {"query": title}
-    if year:
-        params["year"] = year
+def fetch_movie(
+    title: str | None, year: str | None, tmdb_id: int | None = None
+) -> dict | None:
+    if tmdb_id is not None:
+        # Forced ID: skip the search and look the movie up directly.
+        details = _tmdb_get(
+            f"/movie/{tmdb_id}", {"append_to_response": "credits,external_ids"}
+        )
+        if not details or details.get("success") is False:
+            return None
+    else:
+        params = {"query": title}
+        if year:
+            params["year"] = year
 
-    data = _tmdb_get("/search/movie", params)
-    if not data:
-        return None
+        data = _tmdb_get("/search/movie", params)
+        if not data:
+            return None
 
-    best = _pick_best_movie(data.get("results", []), title, year)
-    if best is None:
-        return None
+        best = _pick_best_movie(data.get("results", []), title, year)
+        if best is None:
+            return None
 
-    details = _tmdb_get(
-        f"/movie/{best['id']}", {"append_to_response": "credits,external_ids"}
-    ) or best
+        details = _tmdb_get(
+            f"/movie/{best['id']}", {"append_to_response": "credits,external_ids"}
+        ) or best
 
     credits = details.get("credits", {})
     cast = credits.get("cast", [])[:MAX_ACTORS]
@@ -491,11 +499,11 @@ def build_movie_nfo(m: dict) -> ET.ElementTree:
 
 _EPISODE_PATTERNS = [
     re.compile(
-        r'^(?P<show>.*?)[\s._-]+[Ss](?P<season>\d{1,2})[\s._-]?[Ee](?P<episode>\d{1,3})'
+        r'^(?:(?P<show>.*?)[\s._-]+)?[Ss](?P<season>\d{1,2})[\s._-]?[Ee](?P<episode>\d{1,3})'
         r'(?:[\s._-]+(?P<title>.*))?$'
     ),
     re.compile(
-        r'^(?P<show>.*?)[\s._-]+(?P<season>\d{1,2})x(?P<episode>\d{1,3})'
+        r'^(?:(?P<show>.*?)[\s._-]+)?(?P<season>\d{1,2})x(?P<episode>\d{1,3})'
         r'(?:[\s._-]+(?P<title>.*))?$'
     ),
 ]
@@ -506,7 +514,7 @@ def parse_episode_filename(path: str | Path) -> dict:
     for pattern in _EPISODE_PATTERNS:
         m = pattern.match(stem)
         if m:
-            show = re.sub(r'[.\s_]+', ' ', m.group("show")).strip(" -")
+            show = re.sub(r'[.\s_]+', ' ', m.group("show") or "").strip(" -")
             title = m.group("title")
             if title:
                 title = re.sub(r'[.\s_]+', ' ', title).strip(" -") or None
@@ -536,14 +544,22 @@ def _pick_best_tv(results: list, show: str) -> dict | None:
     return results[0]
 
 
-def fetch_episode(show: str, season: int, episode: int) -> dict | None:
-    data = _tmdb_get("/search/tv", {"query": show})
-    if not data:
-        return None
+def fetch_episode(
+    show: str, season: int, episode: int, tmdb_id: int | None = None
+) -> dict | None:
+    if tmdb_id is not None:
+        # Forced series ID: skip the search and look the show up directly.
+        best = _tmdb_get(f"/tv/{tmdb_id}")
+        if not best or best.get("success") is False:
+            return None
+    else:
+        data = _tmdb_get("/search/tv", {"query": show})
+        if not data:
+            return None
 
-    best = _pick_best_tv(data.get("results", []), show)
-    if best is None:
-        return None
+        best = _pick_best_tv(data.get("results", []), show)
+        if best is None:
+            return None
 
     ep = _tmdb_get(f"/tv/{best['id']}/season/{season}/episode/{episode}")
     if not ep or ep.get("success") is False:
@@ -551,7 +567,7 @@ def fetch_episode(show: str, season: int, episode: int) -> dict | None:
 
     return {
         "title": ep.get("name"),
-        "showtitle": best.get("name") or show,
+        "showtitle": best.get("name") or show or None,
         "season": season,
         "episode": episode,
         "plot": ep.get("overview"),
@@ -589,74 +605,83 @@ def build_episode_nfo(e: dict) -> ET.ElementTree:
 # ---------------------------------------------------------------------------
 
 
-def _process_musicvideo(file_path: str, overwrite: bool) -> str | None:
-    """Return a label if no NFO could be made for the file, else None."""
+def _process_musicvideo(file_path: str, overwrite: bool) -> None:
     parsed = parse_musicvideo_filename(file_path)
     if not parsed["title"]:
         print("  skipped: could not parse filename", file=sys.stderr)
-        return Path(file_path).name
+        return
 
     if not parsed["artist"]:
         print(
             f'  skipped: no artist in filename "{parsed["raw_stem"]}"',
             file=sys.stderr,
         )
-        return Path(file_path).name
+        return
 
     metadata = search_recording(parsed["artist"], parsed["title"])
     if metadata is None:
-        label = f'{parsed["artist"]} - {parsed["title"]}'
         print(
-            f'  skipped: no confident MusicBrainz match for "{label}"',
+            f"  skipped: no confident MusicBrainz match for "
+            f'"{parsed["artist"]} - {parsed["title"]}"',
             file=sys.stderr,
         )
-        return label
+        return
 
     nfo_path = write_nfo(file_path, build_musicvideo_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
-    return None
 
 
-def _process_movie(file_path: str, overwrite: bool) -> str | None:
-    """Return a label if no NFO could be made for the file, else None."""
+def _process_movie(file_path: str, overwrite: bool, tmdb_id: int | None = None) -> None:
     parsed = parse_movie_filename(file_path)
-    if not parsed["title"]:
+    if not parsed["title"] and tmdb_id is None:
         print("  skipped: could not parse filename", file=sys.stderr)
-        return Path(file_path).name
+        return
 
-    metadata = fetch_movie(parsed["title"], parsed["year"])
+    metadata = fetch_movie(parsed["title"], parsed["year"], tmdb_id)
     if metadata is None:
-        label = parsed["title"] + (f" ({parsed['year']})" if parsed["year"] else "")
-        print(f'  skipped: no confident TMDB match for "{label}"', file=sys.stderr)
-        return label
+        if tmdb_id is not None:
+            print(f"  skipped: TMDB movie ID {tmdb_id} not found", file=sys.stderr)
+        else:
+            label = parsed["title"] + (f" ({parsed['year']})" if parsed["year"] else "")
+            print(f'  skipped: no confident TMDB match for "{label}"', file=sys.stderr)
+        return
 
     nfo_path = write_nfo(file_path, build_movie_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
-    return None
 
 
-def _process_episode(file_path: str, overwrite: bool) -> str | None:
-    """Return a label if no NFO could be made for the file, else None."""
+def _process_episode(file_path: str, overwrite: bool, tmdb_id: int | None = None) -> None:
     parsed = parse_episode_filename(file_path)
-    if not parsed["show"] or parsed["season"] is None:
+    if parsed["season"] is None or (not parsed["show"] and tmdb_id is None):
         print(
             "  skipped: could not parse show/season/episode from filename",
             file=sys.stderr,
         )
-        return Path(file_path).name
+        return
 
-    metadata = fetch_episode(parsed["show"], parsed["season"], parsed["episode"])
+    metadata = fetch_episode(
+        parsed["show"], parsed["season"], parsed["episode"], tmdb_id
+    )
     if metadata is None:
-        label = f'{parsed["show"]} S{parsed["season"]:02d}E{parsed["episode"]:02d}'
-        print(f'  skipped: no confident TMDB match for "{label}"', file=sys.stderr)
-        return label
+        if tmdb_id is not None:
+            print(
+                f"  skipped: TMDB show ID {tmdb_id} has no "
+                f'S{parsed["season"]:02d}E{parsed["episode"]:02d}',
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f'  skipped: no confident TMDB match for "{parsed["show"]} '
+                f'S{parsed["season"]:02d}E{parsed["episode"]:02d}"',
+                file=sys.stderr,
+            )
+        return
 
     nfo_path = write_nfo(file_path, build_episode_nfo(metadata), overwrite)
     if nfo_path:
         print(f"  wrote: {nfo_path}", file=sys.stderr)
-    return None
 
 
 _HANDLERS = {
@@ -684,14 +709,33 @@ def main() -> None:
     subparsers.add_parser(
         "musicvideo", parents=[common], help="Music videos (MusicBrainz)"
     )
-    subparsers.add_parser("movie", parents=[common], help="Movies (TMDB)")
-    subparsers.add_parser("episode", parents=[common], help="TV episodes (TMDB)")
+    movie_parser = subparsers.add_parser("movie", parents=[common], help="Movies (TMDB)")
+    movie_parser.add_argument(
+        "-t",
+        "--tmdb-id",
+        type=int,
+        metavar="ID",
+        help="Force this TMDB movie ID instead of searching by filename "
+        "(single file only)",
+    )
+    episode_parser = subparsers.add_parser(
+        "episode", parents=[common], help="TV episodes (TMDB)"
+    )
+    episode_parser.add_argument(
+        "-t",
+        "--tmdb-id",
+        type=int,
+        metavar="ID",
+        help="Force this TMDB TV *series* ID instead of searching by show name. "
+        "Season/episode numbers are still read from each filename",
+    )
 
     args = parser.parse_args()
     handler = _HANDLERS[args.type]
+    tmdb_id = getattr(args, "tmdb_id", None)
 
-    attempted = 0
-    unmatched: list[str] = []
+    if args.type == "movie" and tmdb_id is not None and len(args.files) > 1:
+        parser.error("--tmdb-id can only be used with a single movie file")
 
     for file_path in args.files:
         nfo_path = Path(file_path).with_suffix(".nfo")
@@ -700,23 +744,13 @@ def main() -> None:
             continue
 
         print(f"Processing: {file_path}", file=sys.stderr)
-        attempted += 1
         try:
-            failed_label = handler(file_path, args.overwrite)
+            if args.type in ("movie", "episode"):
+                handler(file_path, args.overwrite, tmdb_id)
+            else:
+                handler(file_path, args.overwrite)
         except Exception as exc:
             print(f"  ERROR: {exc}", file=sys.stderr)
-            failed_label = Path(file_path).name
-        if failed_label:
-            unmatched.append(failed_label)
-
-    if unmatched:
-        print(file=sys.stderr)
-        if len(unmatched) == attempted:
-            print("No matches were found - check your file naming convention.", file=sys.stderr)
-        else:
-            print(f"No NFO created for {len(unmatched)} file(s):", file=sys.stderr)
-            for label in unmatched:
-                print(f"  {label}", file=sys.stderr)
 
 
 if __name__ == "__main__":
